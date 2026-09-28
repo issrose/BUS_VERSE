@@ -1,0 +1,33 @@
+const {test} = require('node:test');
+const assert = require('node:assert/strict');
+const {spawn} = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+test('HTTP booking API persists, rejects duplicate seats and retains cancellations', async t => {
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'bv-api-'));
+ const child=spawn(process.execPath,['server.js'],{cwd:path.resolve(__dirname,'..'),env:{...process.env,PORT:'5099',BUSVERSE_DB_FILE:path.join(dir,'db.json')},stdio:['ignore','pipe','pipe']});
+ t.after(()=>{child.kill(); fs.rmSync(dir,{recursive:true,force:true});});
+ await new Promise((resolve,reject)=>{child.stdout.on('data',d=>{if(String(d).includes('Local:'))resolve()});child.once('error',reject);child.once('exit',c=>reject(new Error('server exited '+c)));});
+ const base='http://127.0.0.1:5099';
+ async function api(route,body){const r=await fetch(base+route,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:undefined);return {status:r.status,body:await r.json()};}
+ const date='2099-01-01';
+ const buses=await api('/api/buses?source=Chemperi&destination=Kannur&date='+date);
+ assert.equal(buses.status,200); assert.ok(buses.body.every(b=>b.source==='Chemperi'&&b.destination==='Kannur'));
+ const bus=buses.body[0], seats=await api(`/api/buses/${bus.id}/seats?date=${date}`);
+ const req={busId:bus.id,seatId:seats.body.seats[0].id,journeyDate:date,ownerEmail:'test@example.com',requestId:crypto.randomUUID(),passenger:{name:'Test',phone:'9876543210',email:'test@example.com'},paymentMethod:'demo-card',paymentOutcome:'success'};
+ const failed=await api('/api/bookings',{...req,paymentOutcome:'failed'}); assert.equal(failed.status,400);
+ const [a,b]=await Promise.all([api('/api/bookings',req),api('/api/bookings',{...req,requestId:crypto.randomUUID()})]);
+ assert.deepEqual([a.status,b.status].sort(),[201,400]);
+ const saved=a.status===201?a.body:b.body;
+ assert.equal(saved.fare,saved.baseFare+saved.tax);
+ assert.equal(fs.existsSync(path.join(dir,'db.json')),true);
+ const disk=JSON.parse(fs.readFileSync(path.join(dir,'db.json')));
+ assert.ok(disk.bookings.some(x=>x.id===saved.id));
+ assert.equal((await api('/api/bookings?ownerEmail=other@example.com')).body.length,0);
+ assert.equal((await api(`/api/bookings/${saved.id}/cancel`,{ownerEmail:'other@example.com'})).status,404);
+ const cancelled=await api(`/api/bookings/${saved.id}/cancel`,{ownerEmail:req.ownerEmail});
+ assert.equal(cancelled.body.booking.status,'cancelled');
+ assert.equal((await api('/api/bookings?ownerEmail=test@example.com')).body[0].status,'cancelled');
+ assert.equal((await api(`/api/buses/${bus.id}/seats?date=${date}`)).body.seats[0].status,'available');
+});
